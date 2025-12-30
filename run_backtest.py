@@ -88,10 +88,37 @@ STRATEGIES = {
             "momentum_period": 24,         # 24-hour momentum
             "momentum_lookback": 168,      # 7 days for momentum z-score
             "vol_threshold": 1.0,          # Volatility within 1 SD
-            "momentum_threshold": 2.0,     # Momentum > 2 SD
-            "stop_loss_pct": 0.05,         # 5% stop loss
-            "take_profit_pct": 0.05,       # 5% take profit
+            "momentum_threshold": 2.5,     # Momentum > 2.5 SD (best from sweep)
+            "stop_loss_pct": 0.05,         # 5% stop loss (baseline)
+            "take_profit_pct": 0.05,       # 5% take profit (baseline)
             "use_iv": False,               # Use realized vol instead of IV
+            "pyramid_enabled": True,       # Enable pyramiding
+            "pyramid_threshold": 0.025,    # Add at 2.5% profit
+            "trail_to_breakeven": True,    # Move SL to breakeven after add
+            "use_atr_stops": False,        # Disable ATR stops
+            "atr_period": 14,              # ATR period (calculated on hourly data)
+            "sl_atr_mult": 3.0,            # Stop loss = entry - 3×ATR
+            "trail_atr_mult": 6.0,         # Trailing stop = highest - 6×ATR (when 'both')
+            "tp_sd_fraction": None,        # Disable vol-based TP for baseline
+            "sl_sd_fraction": None,        # Disable vol-based SL for baseline
+
+            # Dynamic exit approaches (all disabled by default for baseline)
+            "signal_invalidation_enabled": False,  # Exit when momentum fades
+            "momentum_exit_threshold": 1.0,        # Exit long when zscore < 1.0
+
+            "time_exit_enabled": False,            # Exit after max_hold_hours
+            "max_hold_hours": 24,                  # Max hours to hold
+
+            "asymmetric_tp_enabled": False,        # Use separate TP for long/short
+            "tp_long_pct": 0.03,                   # 3% TP for longs
+            "tp_short_pct": 0.02,                  # 2% TP for shorts
+
+            "breakeven_after_profit_enabled": False,  # Move SL to BE after profit
+            "breakeven_trigger_pct": 0.015,           # Trigger at 1.5% profit
+
+            "vol_floor_enabled": False,            # Enforce min TP/SL with vol-based
+            "tp_floor_pct": 0.025,                 # Minimum 2.5% TP
+            "sl_floor_pct": 0.015,                 # Minimum 1.5% SL
         },
         "requires_iv": False,
     },
