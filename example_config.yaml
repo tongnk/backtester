@@ -1,0 +1,46 @@
+# BTC Backtesting Tool Configuration
+# Copy this file and modify as needed
+
+# Data settings
+data:
+  ohlc_dir: "data/ohlc"
+  external_dir: "data/external"
+  symbol: "BTCUSDT"
+  interval: "1m"
+
+# Position sizing and management
+position:
+  # Sizing mode: "fixed_percent", "fixed_amount", or "kelly"
+  sizing_mode: "fixed_percent"
+
+  # For fixed_percent: fraction of equity (1.0 = 100%)
+  # For fixed_amount: BTC quantity
+  # For kelly: base fraction (will be adjusted by Kelly formula)
+  size_value: 1.0
+
+  # Maximum number of entries per position (1 = no pyramiding)
+  max_positions: 1
+
+  # For pyramiding: profit threshold to add (e.g., 0.02 = 2% profit)
+  pyramid_threshold: 0.02
+
+  # Maximum pyramid levels (adds to position)
+  max_pyramid_levels: 3
+
+# Backtesting parameters
+backtest:
+  # Starting capital in USD
+  initial_capital: 10000.0
+
+  # Trading fee rate (e.g., 0.001 = 0.1%)
+  fee_rate: 0.001
+
+  # Slippage rate (e.g., 0.0001 = 0.01%)
+  slippage: 0.0001
+
+  # Optional: limit backtest date range
+  # start_date: "2023-01-01"
+  # end_date: "2024-01-01"
+
+# Output directory for results
+output_dir: "output"
