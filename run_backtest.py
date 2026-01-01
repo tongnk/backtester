@@ -84,14 +84,12 @@ STRATEGIES = {
         "class": IVMomentumStrategy,
         "params": {
             "vol_lookback": 168,           # 7 days in hours
-            "vol_window": 24,              # 24-hour window for realized vol
             "momentum_period": 24,         # 24-hour momentum
             "momentum_lookback": 168,      # 7 days for momentum z-score
             "vol_threshold": 1.0,          # Volatility within 1 SD
             "momentum_threshold": 2.5,     # Momentum > 2.5 SD (best from sweep)
             "stop_loss_pct": 0.05,         # 5% stop loss (baseline)
             "take_profit_pct": 0.05,       # 5% take profit (baseline)
-            "use_iv": False,               # Use realized vol instead of IV
             "pyramid_enabled": True,       # Enable pyramiding
             "pyramid_threshold": 0.025,    # Add at 2.5% profit
             "trail_to_breakeven": True,    # Move SL to breakeven after add
@@ -120,7 +118,7 @@ STRATEGIES = {
             "tp_floor_pct": 0.025,                 # Minimum 2.5% TP
             "sl_floor_pct": 0.015,                 # Minimum 1.5% SL
         },
-        "requires_iv": False,
+        "requires_iv": True,
     },
 }
 
@@ -187,6 +185,19 @@ def parse_args():
         help="Output directory for results",
     )
 
+    # Perpetual futures options
+    parser.add_argument(
+        "--perps",
+        action="store_true",
+        help="Enable perpetual futures mode with funding rates",
+    )
+
+    parser.add_argument(
+        "--maker-fees",
+        action="store_true",
+        help="Use maker fee rate (0.02%%) instead of taker (0.04%%)",
+    )
+
     return parser.parse_args()
 
 
@@ -211,6 +222,16 @@ def main():
         config.backtest.initial_capital = args.capital
 
     config.output_dir = Path(args.output_dir)
+
+    # Configure perps mode
+    if args.perps:
+        config.backtest.perps.enabled = True
+        config.backtest.perps.use_maker_fees = args.maker_fees
+        fee_type = "maker" if args.maker_fees else "taker"
+        fee_rate = config.backtest.perps.effective_fee_rate
+        print(f"\nPerpetual Futures Mode: ENABLED")
+        print(f"Fee Rate: {fee_rate:.4%} ({fee_type})")
+        print("Funding rates will be applied every 8 hours")
 
     # Parse dates
     if args.start_date:
@@ -268,6 +289,14 @@ def main():
                 start_date=start_date,
                 end_date=end_date,
             )
+
+        if args.perps:
+            print("Fetching funding rate data...")
+            data_manager.update_funding_data(
+                symbol=config.data.symbol,
+                start_date=start_date,
+                end_date=end_date,
+            )
     else:
         print("Loading cached data...")
 
@@ -277,6 +306,7 @@ def main():
         start_date=start_date,
         end_date=end_date,
         include_iv=requires_iv,
+        include_funding=args.perps,
         update=False,
     )
 
@@ -298,6 +328,16 @@ def main():
         else:
             iv_coverage = data["iv"].notna().sum() / len(data) * 100
             print(f"IV data coverage: {iv_coverage:.1f}%")
+
+    if args.perps:
+        if "funding_rate" not in data.columns or data["funding_rate"].isna().all():
+            print("\nWARNING: Funding rate data not available.")
+            print("Run with --update-data --perps to fetch funding data.")
+        else:
+            funding_coverage = data["funding_rate"].notna().sum() / len(data) * 100
+            funding_events = data["is_funding_time"].sum() if "is_funding_time" in data.columns else 0
+            print(f"Funding rate coverage: {funding_coverage:.1f}%")
+            print(f"Funding events in period: {funding_events}")
 
     # Initialize strategy
     print("\n" + "-" * 40)

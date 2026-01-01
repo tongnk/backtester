@@ -49,6 +49,13 @@ class PerformanceMetrics:
     expectancy: float
     kelly_fraction: float
 
+    # Funding metrics (perps mode)
+    total_funding_paid: float = 0.0     # Total funding paid
+    total_funding_received: float = 0.0 # Total funding received
+    net_funding: float = 0.0            # Net funding (paid - received)
+    avg_funding_per_trade: float = 0.0  # Average funding cost per trade
+    funding_as_pct_of_pnl: float = 0.0  # Funding cost as % of gross PnL
+
 
 class Metrics:
     """Calculate comprehensive performance metrics."""
@@ -71,6 +78,7 @@ class Metrics:
         trades_df: pd.DataFrame,
         initial_capital: float,
         price_series: pd.Series,
+        funding_df: pd.DataFrame = None,
     ) -> PerformanceMetrics:
         """
         Calculate all performance metrics.
@@ -80,6 +88,7 @@ class Metrics:
             trades_df: DataFrame of completed trades
             initial_capital: Starting capital
             price_series: Asset price series for benchmark
+            funding_df: DataFrame of funding payments (perps mode)
 
         Returns:
             PerformanceMetrics object with all metrics
@@ -124,6 +133,9 @@ class Metrics:
         expectancy = self._calculate_expectancy(trades_df)
         kelly = self._calculate_kelly(trade_stats)
 
+        # Funding stats (perps mode)
+        funding_stats = self._calculate_funding_stats(trades_df, funding_df)
+
         return PerformanceMetrics(
             total_return=total_return,
             total_return_pct=total_return_pct,
@@ -152,6 +164,12 @@ class Metrics:
             short_exposure=exposure["short_exposure"],
             expectancy=expectancy,
             kelly_fraction=kelly,
+            # Funding metrics
+            total_funding_paid=funding_stats["total_funding_paid"],
+            total_funding_received=funding_stats["total_funding_received"],
+            net_funding=funding_stats["net_funding"],
+            avg_funding_per_trade=funding_stats["avg_funding_per_trade"],
+            funding_as_pct_of_pnl=funding_stats["funding_as_pct_of_pnl"],
         )
 
     def _calculate_drawdown(
@@ -188,7 +206,8 @@ class Metrics:
 
     def _calculate_sharpe(self, returns: pd.Series) -> float:
         """Calculate Sharpe ratio."""
-        if returns.std() == 0:
+        std = returns.std()
+        if std < 1e-10:  # Use threshold instead of exact zero check
             return 0.0
 
         # Convert risk-free rate to per-minute for minute data
@@ -196,7 +215,7 @@ class Metrics:
         rf_per_minute = (1 + self.risk_free_rate) ** (1 / minutes_per_year) - 1
 
         excess_returns = returns - rf_per_minute
-        sharpe = (excess_returns.mean() / returns.std()) * np.sqrt(minutes_per_year)
+        sharpe = (excess_returns.mean() / excess_returns.std()) * np.sqrt(minutes_per_year)
 
         return sharpe
 
@@ -275,7 +294,7 @@ class Metrics:
     def _calculate_exposure(
         self, trades_df: pd.DataFrame, equity_curve: pd.Series
     ) -> dict:
-        """Calculate market exposure statistics."""
+        """Calculate market exposure statistics using interval merging."""
         if trades_df.empty:
             return {
                 "time_in_market": 0.0,
@@ -286,23 +305,54 @@ class Metrics:
         total_duration = equity_curve.index[-1] - equity_curve.index[0]
         total_minutes = total_duration.total_seconds() / 60
 
-        time_in_market = 0
-        long_time = 0
-        short_time = 0
+        # Collect intervals by side
+        long_intervals = []
+        short_intervals = []
 
         for _, trade in trades_df.iterrows():
-            duration_minutes = trade["duration"].total_seconds() / 60
-            time_in_market += duration_minutes
-
+            entry = trade["entry_time"]
+            exit = trade["exit_time"]
             if trade["side"] == "LONG":
-                long_time += duration_minutes
+                long_intervals.append((entry, exit))
             else:
-                short_time += duration_minutes
+                short_intervals.append((entry, exit))
+
+        def merge_intervals(intervals):
+            """Merge overlapping intervals and return total duration."""
+            if not intervals:
+                return 0.0
+            # Sort by start time
+            sorted_intervals = sorted(intervals, key=lambda x: x[0])
+            merged = [sorted_intervals[0]]
+
+            for current in sorted_intervals[1:]:
+                prev_start, prev_end = merged[-1]
+                curr_start, curr_end = current
+
+                if curr_start <= prev_end:
+                    # Overlapping - merge
+                    merged[-1] = (prev_start, max(prev_end, curr_end))
+                else:
+                    # Non-overlapping
+                    merged.append(current)
+
+            # Calculate total duration
+            total = 0.0
+            for start, end in merged:
+                total += (end - start).total_seconds() / 60
+            return total
+
+        long_minutes = merge_intervals(long_intervals)
+        short_minutes = merge_intervals(short_intervals)
+
+        # For total time in market, merge all intervals together
+        all_intervals = long_intervals + short_intervals
+        total_in_market = merge_intervals(all_intervals)
 
         return {
-            "time_in_market": time_in_market / total_minutes if total_minutes > 0 else 0,
-            "long_exposure": long_time / total_minutes if total_minutes > 0 else 0,
-            "short_exposure": short_time / total_minutes if total_minutes > 0 else 0,
+            "time_in_market": min(total_in_market / total_minutes, 1.0) if total_minutes > 0 else 0,
+            "long_exposure": min(long_minutes / total_minutes, 1.0) if total_minutes > 0 else 0,
+            "short_exposure": min(short_minutes / total_minutes, 1.0) if total_minutes > 0 else 0,
         }
 
     def _calculate_expectancy(self, trades_df: pd.DataFrame) -> float:
@@ -330,6 +380,59 @@ class Metrics:
 
         # Cap Kelly at reasonable levels
         return max(0, min(kelly, 0.5))
+
+    def _calculate_funding_stats(
+        self,
+        trades_df: pd.DataFrame,
+        funding_df: pd.DataFrame,
+    ) -> dict:
+        """Calculate funding-related statistics."""
+        default_stats = {
+            "total_funding_paid": 0.0,
+            "total_funding_received": 0.0,
+            "net_funding": 0.0,
+            "avg_funding_per_trade": 0.0,
+            "funding_as_pct_of_pnl": 0.0,
+        }
+
+        if funding_df is None or funding_df.empty:
+            return default_stats
+
+        # Aggregate from funding log
+        if "amount" in funding_df.columns:
+            funding_amounts = funding_df["amount"]
+            total_paid = funding_amounts[funding_amounts > 0].sum()
+            total_received = abs(funding_amounts[funding_amounts < 0].sum())
+        else:
+            total_paid = 0.0
+            total_received = 0.0
+
+        net_funding = total_paid - total_received
+
+        # Per-trade average (from trades_df if available)
+        if not trades_df.empty and "funding_paid" in trades_df.columns:
+            avg_per_trade = trades_df["funding_paid"].mean()
+        else:
+            avg_per_trade = net_funding / len(trades_df) if len(trades_df) > 0 else 0.0
+
+        # Funding as percentage of gross PnL
+        if not trades_df.empty and "gross_pnl" in trades_df.columns:
+            gross_pnl = trades_df["gross_pnl"].sum()
+        elif not trades_df.empty:
+            # Fallback: gross = net + fees + funding
+            gross_pnl = trades_df["pnl"].sum() + trades_df["fees"].sum() + net_funding
+        else:
+            gross_pnl = 0.0
+
+        funding_pct = (net_funding / abs(gross_pnl)) * 100 if gross_pnl != 0 else 0.0
+
+        return {
+            "total_funding_paid": total_paid,
+            "total_funding_received": total_received,
+            "net_funding": net_funding,
+            "avg_funding_per_trade": avg_per_trade,
+            "funding_as_pct_of_pnl": funding_pct,
+        }
 
     def summary_string(self, metrics: PerformanceMetrics) -> str:
         """Generate a formatted summary string."""
@@ -368,7 +471,20 @@ class Metrics:
             "POSITION SIZING",
             f"  Expectancy:        ${metrics.expectancy:,.2f}",
             f"  Kelly Fraction:    {metrics.kelly_fraction:.2%}",
-            "=" * 50,
         ]
+
+        # Add funding section if applicable
+        if metrics.net_funding != 0 or metrics.total_funding_paid != 0:
+            lines.extend([
+                "",
+                "FUNDING COSTS (Perps)",
+                f"  Total Paid:        ${metrics.total_funding_paid:,.2f}",
+                f"  Total Received:    ${metrics.total_funding_received:,.2f}",
+                f"  Net Funding:       ${metrics.net_funding:,.2f}",
+                f"  Avg Per Trade:     ${metrics.avg_funding_per_trade:,.2f}",
+                f"  % of Gross PnL:    {metrics.funding_as_pct_of_pnl:.1f}%",
+            ])
+
+        lines.append("=" * 50)
 
         return "\n".join(lines)

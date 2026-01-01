@@ -12,6 +12,26 @@ from plotly.subplots import make_subplots
 from ..engine.backtester import BacktestResult
 
 
+def _resample_ohlc(ohlc_data: pd.DataFrame, freq: str = "1h") -> pd.DataFrame:
+    """
+    Resample OHLC data to a lower frequency for faster chart rendering.
+
+    Args:
+        ohlc_data: DataFrame with OHLC columns and datetime index
+        freq: Target frequency (e.g., "1h" for hourly)
+
+    Returns:
+        Resampled DataFrame
+    """
+    return ohlc_data.resample(freq).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    }).dropna()
+
+
 class ChartGenerator:
     """Generate interactive HTML charts for backtest results."""
 
@@ -338,14 +358,22 @@ class ChartGenerator:
         """Update figure layout with styling and annotations."""
         metrics = result.metrics
 
-        # Create metrics annotation text
+        # Create expanded summary table as HTML
         metrics_text = (
-            f"<b>Performance Summary</b><br>"
-            f"Total Return: {metrics.total_return_pct:.2%}<br>"
-            f"Sharpe Ratio: {metrics.sharpe_ratio:.2f}<br>"
-            f"Max Drawdown: {metrics.max_drawdown:.2%}<br>"
-            f"Win Rate: {metrics.win_rate:.2%}<br>"
-            f"Total Trades: {metrics.total_trades}"
+            f"<b>PERFORMANCE SUMMARY</b><br>"
+            f"<br>"
+            f"<b>Returns</b><br>"
+            f"Total Return: ${metrics.total_return:,.2f} ({metrics.total_return_pct:.2%})<br>"
+            f"Annualized: {metrics.annualized_return:.2%}<br>"
+            f"<br>"
+            f"<b>Risk</b><br>"
+            f"Sharpe: {metrics.sharpe_ratio:.2f} | Sortino: {metrics.sortino_ratio:.2f}<br>"
+            f"Max DD: {metrics.max_drawdown:.2%}<br>"
+            f"<br>"
+            f"<b>Trades</b><br>"
+            f"Total: {metrics.total_trades} | Win Rate: {metrics.win_rate:.1%}<br>"
+            f"Profit Factor: {metrics.profit_factor:.2f}<br>"
+            f"Avg Win: ${metrics.avg_win:,.2f} | Avg Loss: ${metrics.avg_loss:,.2f}"
         )
 
         fig.update_layout(
@@ -376,11 +404,11 @@ class ChartGenerator:
                     xanchor="right",
                     yanchor="top",
                     showarrow=False,
-                    font=dict(size=11),
-                    bgcolor="rgba(0,0,0,0.7)",
+                    font=dict(size=12, family="monospace"),
+                    bgcolor="rgba(0,0,0,0.8)",
                     bordercolor="rgba(255,255,255,0.3)",
                     borderwidth=1,
-                    borderpad=10,
+                    borderpad=12,
                 )
             ],
             hovermode="x unified",
@@ -551,6 +579,7 @@ def generate_report(
     ohlc_data: pd.DataFrame,
     output_dir: str | Path = "output",
     filename: str = "backtest_report",
+    resample_freq: str = "1h",
 ) -> Path:
     """
     Generate a complete backtest report.
@@ -560,6 +589,7 @@ def generate_report(
         ohlc_data: OHLC DataFrame
         output_dir: Output directory
         filename: Base filename (without extension)
+        resample_freq: Frequency to resample OHLC data (e.g., "1h" for hourly)
 
     Returns:
         Path to the generated HTML file
@@ -569,10 +599,14 @@ def generate_report(
 
     generator = ChartGenerator()
 
-    # Create main chart
+    # Resample OHLC data for faster rendering
+    resampled_ohlc = _resample_ohlc(ohlc_data, freq=resample_freq)
+    print(f"Resampled OHLC from {len(ohlc_data):,} to {len(resampled_ohlc):,} rows ({resample_freq})")
+
+    # Create main chart with resampled data
     main_chart = generator.create_backtest_chart(
         result=result,
-        ohlc_data=ohlc_data,
+        ohlc_data=resampled_ohlc,
         show_indicators=True,
         show_volume=True,
     )

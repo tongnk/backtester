@@ -5,7 +5,6 @@
 | Variable | Default | Description | Section |
 |----------|---------|-------------|---------|
 | [vol_lookback](#vol_lookback) | 168 | Hours for volatility z-score calculation (7 days) | Entry |
-| [vol_window](#vol_window) | 24 | Hours for realized vol calculation | Entry |
 | [vol_threshold](#vol_threshold) | 1.0 | Max vol z-score to allow entry (±1 SD) | Entry |
 | [momentum_period](#momentum_period) | 24 | Hours for momentum calculation | Entry |
 | [momentum_lookback](#momentum_lookback) | 168 | Hours for momentum z-score (7 days) | Entry |
@@ -20,7 +19,7 @@
 | [atr_period](#atr_period) | 14 | ATR calculation period (hours) | Exit |
 | [sl_atr_mult](#sl_atr_mult) | 3.0 | SL multiplier for ATR | Exit |
 | [trail_atr_mult](#trail_atr_mult) | 6.0 | Trailing stop multiplier for ATR | Exit |
-| [use_iv](#use_iv) | False | Use IV instead of realized vol | Entry |
+| [iv_source](#iv_source) | DVOL | Implied volatility source (Deribit DVOL) | Data |
 
 ---
 
@@ -28,19 +27,11 @@
 
 ### vol_lookback
 
-Lookback period (in hours) for calculating the volatility z-score.
+Lookback period (in hours) for calculating the IV z-score.
 
 - **Default**: 168 (7 days)
 - **Impact**: Longer = smoother z-score, fewer signals. Shorter = more reactive.
 - **Used for**: Determining if current volatility is "normal" (within ±vol_threshold SDs)
-
-### vol_window
-
-Window (in hours) for calculating realized volatility from returns.
-
-- **Default**: 24 (1 day)
-- **Calculation**: `std(returns) * sqrt(525600)` to annualize from minute data
-- **Impact**: Shorter = more reactive to recent vol spikes
 
 ### vol_threshold
 
@@ -179,9 +170,9 @@ Move stop loss to breakeven (average entry) after pyramiding.
 
 ## Data Source
 
-### use_iv
+### iv_source
 
-Use implied volatility from Deribit instead of realized volatility.
+Implied volatility comes from Deribit DVOL and is used for all volatility filters and vol-based TP/SL.
 
-- **Default**: False
-- **Note**: IV data has limited historical coverage (~0.2%). Currently using realized vol as proxy.
+- **Default**: DVOL
+- **Note**: DVOL is stored in percent; it is normalized to decimal form on load for calculations.

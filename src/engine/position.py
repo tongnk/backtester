@@ -38,6 +38,24 @@ class Fill:
 
 
 @dataclass
+class FundingPayment:
+    """
+    Represents a single funding payment for perpetual futures.
+
+    Funding mechanics:
+    - Long + positive rate = pay funding (amount > 0)
+    - Long + negative rate = receive funding (amount < 0)
+    - Short + positive rate = receive funding (amount < 0)
+    - Short + negative rate = pay funding (amount > 0)
+    """
+    timestamp: datetime
+    rate: float           # Funding rate (can be positive or negative)
+    position_value: float # Position notional at funding time
+    amount: float         # Actual payment (positive = paid, negative = received)
+    side: PositionSide    # Position side at funding time
+
+
+@dataclass
 class Position:
     """
     Represents an open position with multiple fills (pyramiding support).
@@ -47,12 +65,15 @@ class Position:
     - Weighted average entry price
     - Current unrealized PnL
     - Partial exits
+    - Funding payments (for perpetual futures)
     """
     side: PositionSide
     fills: list[Fill] = field(default_factory=list)
     exit_fills: list[Fill] = field(default_factory=list)
     entry_time: Optional[datetime] = None
     exit_time: Optional[datetime] = None
+    # Funding tracking for perpetual futures
+    funding_payments: list[FundingPayment] = field(default_factory=list)
 
     @property
     def quantity(self) -> float:
@@ -92,6 +113,15 @@ class Position:
         return entry_fees + exit_fees
 
     @property
+    def total_funding(self) -> float:
+        """Total funding paid (positive) or received (negative)."""
+        return sum(fp.amount for fp in self.funding_payments)
+
+    def add_funding_payment(self, payment: FundingPayment) -> None:
+        """Record a funding payment."""
+        self.funding_payments.append(payment)
+
+    @property
     def entry_qty(self) -> float:
         """Total entry quantity."""
         return sum(f.quantity for f in self.fills)
@@ -124,7 +154,7 @@ class Position:
             return (self.avg_entry_price - current_price) * self.quantity
 
     def realized_pnl(self) -> float:
-        """Calculate realized PnL from closed portion."""
+        """Calculate realized PnL from closed portion (includes fees and funding)."""
         if not self.exit_fills:
             return 0.0
 
@@ -134,7 +164,8 @@ class Position:
         else:  # SHORT
             pnl = (self.avg_entry_price - self.avg_exit_price) * exit_qty
 
-        return pnl - self.total_fees
+        # Deduct fees and funding costs
+        return pnl - self.total_fees - self.total_funding
 
     @property
     def pyramid_count(self) -> int:
@@ -163,6 +194,9 @@ class Trade:
     pnl_pct: float
     fees: float
     pyramid_levels: int
+    # Funding tracking for perpetual futures
+    funding_paid: float = 0.0      # Total funding paid (positive = cost)
+    funding_count: int = 0         # Number of funding events during trade
 
     @property
     def duration(self) -> pd.Timedelta:
@@ -171,6 +205,11 @@ class Trade:
     @property
     def is_winner(self) -> bool:
         return self.pnl > 0
+
+    @property
+    def gross_pnl(self) -> float:
+        """PnL before fees and funding."""
+        return self.pnl + self.fees + self.funding_paid
 
 
 class PositionManager:
@@ -181,6 +220,7 @@ class PositionManager:
     - Multiple concurrent positions (pyramiding)
     - Position sizing modes
     - Trade logging
+    - Funding rate tracking (perpetual futures)
     """
 
     def __init__(
@@ -188,6 +228,7 @@ class PositionManager:
         max_positions: int = 1,
         fee_rate: float = 0.001,
         slippage: float = 0.0,
+        perps_mode: bool = False,
     ):
         """
         Initialize the position manager.
@@ -196,14 +237,17 @@ class PositionManager:
             max_positions: Maximum concurrent positions
             fee_rate: Trading fee rate (e.g., 0.001 = 0.1%)
             slippage: Slippage rate (e.g., 0.0001 = 0.01%)
+            perps_mode: Whether using perpetual futures (enables funding)
         """
         self.max_positions = max_positions
         self.fee_rate = fee_rate
         self.slippage = slippage
+        self.perps_mode = perps_mode
 
         self.current_position: Optional[Position] = None
         self.trades: list[Trade] = []
         self.trade_log: list[dict] = []
+        self.funding_log: list[dict] = []  # Track funding events
 
     @property
     def is_flat(self) -> bool:
@@ -391,6 +435,66 @@ class PositionManager:
 
         return close_fill, open_fill
 
+    def apply_funding(
+        self,
+        timestamp: datetime,
+        funding_rate: float,
+        mark_price: float,
+    ) -> Optional[FundingPayment]:
+        """
+        Apply funding rate to current position.
+
+        Called at funding times (00:00, 08:00, 16:00 UTC) when position is open.
+
+        Funding mechanics:
+        - Long position + positive rate = pay funding
+        - Long position + negative rate = receive funding
+        - Short position + positive rate = receive funding
+        - Short position + negative rate = pay funding
+
+        Args:
+            timestamp: Funding timestamp
+            funding_rate: Funding rate (e.g., 0.0001 for 0.01%)
+            mark_price: Mark price at funding time
+
+        Returns:
+            FundingPayment if position was open, None otherwise
+        """
+        if self.is_flat:
+            return None
+
+        position = self.current_position
+        position_value = position.quantity * mark_price
+
+        # Calculate payment direction based on position side
+        if position.side == PositionSide.LONG:
+            # Longs pay positive funding, receive negative
+            payment_amount = funding_rate * position_value
+        else:  # SHORT
+            # Shorts receive positive funding, pay negative
+            payment_amount = -funding_rate * position_value
+
+        funding_payment = FundingPayment(
+            timestamp=timestamp,
+            rate=funding_rate,
+            position_value=position_value,
+            amount=payment_amount,
+            side=position.side,
+        )
+
+        position.add_funding_payment(funding_payment)
+
+        # Log the funding event
+        self.funding_log.append({
+            "timestamp": timestamp,
+            "rate": funding_rate,
+            "position_value": position_value,
+            "amount": payment_amount,
+            "side": position.side.name,
+        })
+
+        return funding_payment
+
     def _record_trade(self) -> None:
         """Record completed trade."""
         pos = self.current_position
@@ -410,6 +514,8 @@ class PositionManager:
             pnl_pct=pnl_pct,
             fees=pos.total_fees,
             pyramid_levels=pos.pyramid_count,
+            funding_paid=pos.total_funding,
+            funding_count=len(pos.funding_payments),
         )
 
         self.trades.append(trade)
@@ -458,12 +564,21 @@ class PositionManager:
                 "pyramid_levels": t.pyramid_levels,
                 "duration": t.duration,
                 "is_winner": t.is_winner,
+                # Funding columns (for perps)
+                "funding_paid": t.funding_paid,
+                "funding_count": t.funding_count,
+                "gross_pnl": t.gross_pnl,
             })
 
         return pd.DataFrame(data)
+
+    def get_funding_log_df(self) -> pd.DataFrame:
+        """Get funding log as DataFrame."""
+        return pd.DataFrame(self.funding_log)
 
     def reset(self) -> None:
         """Reset all positions and trade history."""
         self.current_position = None
         self.trades = []
         self.trade_log = []
+        self.funding_log = []

@@ -2,10 +2,13 @@
 
 ## Summary
 
-**Best Configuration Found**: Fixed 5% SL / 5% TP with 2.5 SD momentum threshold
-- Return: +4.98% (2 years)
-- Win Rate: 62%
-- Benchmark (B&H): +107%
+**Best Configuration Found**: Long-only with 12h time exit
+- Return: +0.09% net (after fees), ~+25% gross
+- Win Rate: 50%
+- Profit Factor: 1.22
+- Benchmark (B&H): -5.83% (test period) to +107% (full 2 years)
+
+**Key Insight**: The IV momentum signal has directional edge for LONG only. SHORT signals are net losers at all time horizons.
 
 ---
 
@@ -17,7 +20,13 @@
 4. [Dynamic TP (Historical Moves)](#4-dynamic-tp-historical-moves)
 5. [Vol-Based TP (SD Fraction)](#5-vol-based-tp-sd-fraction)
 6. [Price Movement Analysis](#6-price-movement-analysis)
-7. [Key Insights](#7-key-insights)
+7. [Key Insights (Phase 1)](#7-key-insights-phase-1)
+8. [IV Data & DVOL Integration](#8-iv-data--dvol-integration)
+9. [Signal Quality Analysis](#9-signal-quality-analysis)
+10. [Direction & Time Exit Optimization](#10-direction--time-exit-optimization)
+11. [Trading Cost Analysis](#11-trading-cost-analysis)
+12. [Key Insights (Phase 2)](#12-key-insights-phase-2)
+13. [Suggested Next Steps](#13-suggested-next-steps)
 
 ---
 
@@ -133,7 +142,7 @@ Price pulls back to $99,500
 
 ## 5. Vol-Based TP (SD Fraction)
 
-**Hypothesis**: Use realized vol to set TP as fraction of expected 1 SD move.
+**Hypothesis**: Use implied vol (DVOL) to set TP as fraction of expected 1 SD move.
 
 **Calculation**:
 ```
@@ -189,7 +198,7 @@ TP = 1 SD move × tp_sd_fraction
 
 ---
 
-## 7. Key Insights
+## 7. Key Insights (Phase 1)
 
 ### What Works
 1. **2.5 SD momentum threshold** - Higher quality signals, better win rate
@@ -223,9 +232,221 @@ All alternative TP approaches fail because they create poor risk:reward:
 
 The pyramiding with breakeven stop is what makes the fixed approach work - it changes the effective R:R by protecting profits after adding.
 
-### Future Directions to Test
+### Future Directions to Test (Phase 1)
 
 1. **Long-only mode** - Strategy was short 56% of time in a +107% bull market
 2. **Different SL sizing** - Vol-based SL instead of fixed 5%?
 3. **Time-based exits** - Exit after 24h if TP not hit?
 4. **Separate long/short parameters** - Longs show 2.66% avg move vs 2.15% for shorts
+
+---
+
+## 8. IV Data & DVOL Integration
+
+**Change**: Switched from realized volatility (calculated from returns) to implied volatility using Deribit's DVOL index.
+
+### Data Source
+- **DVOL**: Deribit's implied volatility index for BTC options
+- **Resolution**: Daily values (API limitation), forward-filled to minute bars
+- **Coverage**: 735 days (Dec 29, 2023 - Dec 30, 2025)
+- **Range**: 33.81% to 83.02% annualized
+
+### Why DVOL?
+1. Forward-looking (market expectations) vs backward-looking (realized)
+2. Incorporates options market intelligence
+3. More responsive to regime changes
+4. Better proxy for "calm market" detection
+
+### Implementation
+```python
+# Old: Realized vol from returns
+returns = df["close"].pct_change()
+realized_vol = returns.rolling(window).std() * np.sqrt(525600)
+
+# New: Direct DVOL usage
+iv = df["iv"]  # Deribit DVOL, already annualized
+```
+
+---
+
+## 9. Signal Quality Analysis
+
+**Goal**: Separate entry signal quality from exit logic (TP/SL).
+
+### Methodology
+For each signal, calculate forward returns at various horizons (1h, 2h, 4h, 8h, 12h, 24h) without any TP/SL interference.
+
+### Forward Return Analysis by Signal Direction
+
+| Horizon | LONG Signals | SHORT Signals | Going Contrarian (LONG on SHORT) |
+|---------|--------------|---------------|----------------------------------|
+| 1h | +0.02% | -0.05% | +0.05% |
+| 2h | +0.05% | -0.08% | +0.08% |
+| 4h | +0.12% | -0.10% | +0.10% |
+| 8h | +0.22% | -0.12% | +0.12% |
+| 12h | +0.28% | -0.08% | +0.08% |
+| 24h | +0.25% | +0.02% | -0.02% |
+
+### Win Rate by Horizon (> 0% return)
+
+| Horizon | LONG Win Rate | SHORT Win Rate |
+|---------|---------------|----------------|
+| 4h | 52% | 45% |
+| 8h | 55% | 43% |
+| 12h | 58% | 46% |
+| 24h | 54% | 50% |
+
+### Key Discovery
+1. **LONG signals have consistent edge** at 4-12h horizons (55-58% win rate)
+2. **SHORT signals are net losers** at all horizons up to 24h
+3. **Optimal hold period is 8-12 hours** - edge peaks then decays
+4. **Going contrarian on SHORT signals is profitable** (essentially more LONG exposure)
+
+---
+
+## 10. Direction & Time Exit Optimization
+
+**Hypothesis**: Use only LONG signals with time-based exit at optimal horizon.
+
+### Strategy Modifications
+Added configurable parameters:
+- `direction`: "both", "long_only", or "short_only"
+- `hold_hours`: Fixed time exit (None to disable)
+
+### Parameter Sweep Results
+
+| Config | Return | MaxDD | Trades | Win Rate | Profit Factor |
+|--------|--------|-------|--------|----------|---------------|
+| **long_only, 12h** | **+0.09%** | -0.08% | 94 | 50% | **1.22** |
+| long_only, 8h | +0.02% | -0.08% | 94 | 40% | 1.05 |
+| long_only, 24h | +0.06% | -0.16% | 86 | 50% | 1.07 |
+| long_only, 12h, 2%SL | +0.05% | -0.08% | 94 | 50% | 1.11 |
+| both, 12h | -0.10% | -0.18% | 166 | 40% | 0.87 |
+| short_only, 12h | -0.22% | -0.24% | 92 | 40% | 0.55 |
+| **Buy & Hold** | **-5.83%** | — | — | — | — |
+
+### Conclusions
+1. **Long-only is essential** - All long-only variants beat market
+2. **12h hold is optimal** - Matches forward return analysis
+3. **Adding SL slightly hurts** - Time exit alone is cleaner
+4. **SHORT signals destroy value** - Negative contribution at all settings
+
+---
+
+## 11. Trading Cost Analysis
+
+**Problem**: Simulation showed +25.15% gross return, but backtest shows +0.09% net.
+
+### Cost Structure
+| Component | Rate |
+|-----------|------|
+| Trading fee | 0.1% per side |
+| Slippage | 0.01% per side |
+| **Round-trip cost** | **0.22%** |
+
+### Impact on 94 Trades
+```
+Gross return (simulation):     +25.15%
+Trading costs (94 × 0.22%):   -20.68%
+Execution differences:         -4.38%
+Net return:                    +0.09%
+```
+
+### The Fee Drag Problem
+At 0.22% round-trip cost:
+- Need 0.22% edge per trade just to break even
+- 94 trades × 0.22% = 20.68% annual drag
+- Only strategies with >20% gross edge can be net profitable
+
+### Realistic Fee Scenarios
+| Exchange/Tier | Maker Fee | Round-trip | Annual Drag (94 trades) |
+|---------------|-----------|------------|-------------------------|
+| Default (taker) | 0.10% | 0.22% | 20.68% |
+| VIP tier | 0.04% | 0.10% | 9.40% |
+| Market maker | 0.00% | 0.02% | 1.88% |
+
+---
+
+## 12. Key Insights (Phase 2)
+
+### The IV Momentum Signal
+1. **Rising IV predicts upward price movement** - The core edge
+2. **Falling IV does NOT predict downward movement** - Asymmetric signal
+3. **Signal decays after 12 hours** - Time-limited edge
+
+### Why SHORT Fails
+- BTC has long-term upward drift
+- IV spikes often coincide with fear/capitulation (buying opportunities)
+- "Falling IV = calm = short" doesn't capture mean reversion buying
+
+### Optimal Configuration
+```python
+params = {
+    "direction": "long_only",
+    "hold_hours": 12,
+    "momentum_threshold": 2.0,
+    "vol_threshold": 1.0,
+    # No TP/SL - pure time exit
+}
+```
+
+### The Economics Problem
+- Strategy has ~25% gross edge (excellent)
+- Trading costs consume ~20% (at default fees)
+- Net edge is ~5% before slippage variance
+- **Need fee reduction or fewer trades to be viable**
+
+---
+
+## 13. Suggested Next Steps
+
+### High Priority - Fee Reduction
+
+1. **Reduce Trade Frequency**
+   - Increase momentum threshold (2.5 or 3.0 SD)
+   - Add minimum time between signals (e.g., 24h cooldown)
+   - Only trade on strongest signals
+
+2. **Test with Realistic Fees**
+   - Run backtest with 0.04% maker fee (VIP tier)
+   - Expected improvement: +11% annually
+
+### Medium Priority - Signal Enhancement
+
+3. **Regime Filtering**
+   - Only trade when IV is rising from low base (< median)
+   - Avoid trading when IV already elevated (> 70th percentile)
+
+4. **Multi-Timeframe Confirmation**
+   - Require momentum on both 12h and 24h timeframes
+   - Should reduce false signals
+
+5. **Volume Confirmation**
+   - Add volume filter (momentum + volume spike)
+   - Higher conviction entries
+
+### Lower Priority - Alternative Approaches
+
+6. **Longer Hold Periods**
+   - Test 24h, 48h, 72h exits
+   - Fewer trades = less fee drag
+   - May capture larger moves
+
+7. **Contrarian Mode**
+   - Go LONG on SHORT signals (since they predict upward movement)
+   - Double the LONG exposure
+
+8. **IV Level Strategy**
+   - Instead of IV momentum, trade IV levels
+   - Buy when IV > X percentile (fear)
+   - Different edge source
+
+### Data & Infrastructure
+
+9. **Real-Time DVOL**
+   - Currently using daily DVOL forward-filled
+   - Minute-resolution DVOL may improve signal timing
+
+10. **Out-of-Sample Testing**
+    - Current results are in-sample
+    - Need walk-forward or holdout period validation

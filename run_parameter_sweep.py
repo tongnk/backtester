@@ -18,6 +18,7 @@ Hypotheses:
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta
+from multiprocessing import Pool, cpu_count
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -35,7 +36,6 @@ from src.engine import Backtester
 VARIATIONS = {
     "1. Baseline": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 24,
         "momentum_lookback": 168,
         "vol_threshold": 1.0,
@@ -45,7 +45,6 @@ VARIATIONS = {
     },
     "2. Asymmetric SL/TP (4%/7%)": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 24,
         "momentum_lookback": 168,
         "vol_threshold": 1.0,
@@ -55,7 +54,6 @@ VARIATIONS = {
     },
     "3. High Momentum (2.5 SD)": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 24,
         "momentum_lookback": 168,
         "vol_threshold": 1.0,
@@ -65,7 +63,6 @@ VARIATIONS = {
     },
     "4. Very High Momentum (3.0 SD)": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 24,
         "momentum_lookback": 168,
         "vol_threshold": 1.0,
@@ -75,7 +72,6 @@ VARIATIONS = {
     },
     "5. Tight Vol (0.5 SD)": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 24,
         "momentum_lookback": 168,
         "vol_threshold": 0.5,
@@ -85,7 +81,6 @@ VARIATIONS = {
     },
     "6. Wide Vol (1.5 SD)": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 24,
         "momentum_lookback": 168,
         "vol_threshold": 1.5,
@@ -95,7 +90,6 @@ VARIATIONS = {
     },
     "7. Longer Momentum (48h)": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 48,
         "momentum_lookback": 168,
         "vol_threshold": 1.0,
@@ -105,7 +99,6 @@ VARIATIONS = {
     },
     "8. High Mom + Asym SL/TP": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 24,
         "momentum_lookback": 168,
         "vol_threshold": 1.0,
@@ -115,7 +108,6 @@ VARIATIONS = {
     },
     "9. Tight Vol + High Mom": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 24,
         "momentum_lookback": 168,
         "vol_threshold": 0.5,
@@ -125,7 +117,6 @@ VARIATIONS = {
     },
     "10. Aggressive (3%/10%)": {
         "vol_lookback": 168,
-        "vol_window": 24,
         "momentum_period": 24,
         "momentum_lookback": 168,
         "vol_threshold": 1.0,
@@ -154,6 +145,14 @@ def run_backtest(params: dict, data: pd.DataFrame, config: Config) -> dict:
     }
 
 
+def _run_single_backtest(args):
+    """Worker function for parallel execution."""
+    name, params, data = args
+    config = Config()  # Create fresh config in worker (avoids pickling issues)
+    result = run_backtest(params, data, config)
+    return name, result
+
+
 def main():
     print("=" * 60)
     print("PARAMETER SWEEP - Volatility Momentum Strategy")
@@ -175,25 +174,30 @@ def main():
         symbol=config.data.symbol,
         start_date=start_date,
         end_date=end_date,
-        include_iv=False,
+        include_iv=True,
         update=False,
     )
     print(f"Data loaded: {len(data):,} rows")
 
-    # Run all variations
-    results = {}
-    for name, params in VARIATIONS.items():
-        print(f"\nRunning: {name}")
-        print(f"  Params: vol_thresh={params['vol_threshold']}, mom_thresh={params['momentum_threshold']}, "
-              f"SL={params['stop_loss_pct']*100:.0f}%, TP={params['take_profit_pct']*100:.0f}%")
+    # Run all variations in parallel
+    n_workers = min(cpu_count(), len(VARIATIONS))
+    print(f"\nRunning {len(VARIATIONS)} backtests in parallel ({n_workers} workers)...")
 
-        result = run_backtest(params, data.copy(), config)
-        results[name] = result
+    # Prepare arguments for parallel execution
+    args_list = [(name, params, data.copy()) for name, params in VARIATIONS.items()]
 
-        print(f"  Return: {result['total_return_pct']:.2f}% | "
-              f"MaxDD: {result['max_drawdown']:.2f}% | "
-              f"Trades: {result['total_trades']} | "
-              f"Win Rate: {result['win_rate']:.1f}%")
+    # Execute in parallel
+    with Pool(n_workers) as pool:
+        results_list = pool.map(_run_single_backtest, args_list)
+
+    # Convert to dict
+    results = dict(results_list)
+
+    # Print results summary
+    for name, result in results.items():
+        print(f"  {name}: Return={result['total_return_pct']:.2f}% | "
+              f"MaxDD={result['max_drawdown']:.2f}% | "
+              f"Trades={result['total_trades']}")
 
     # Calculate buy & hold for comparison
     print("\nCalculating Buy & Hold benchmark...")

@@ -10,10 +10,10 @@ from ..base import Strategy, StrategyResult, Signal
 
 class IVMomentumStrategy(Strategy):
     """
-    Volatility-Momentum Strategy with Pyramiding Support.
+    Volatility-Momentum Strategy with configurable direction and exit modes.
 
     Entry logic:
-    - Calculate realized volatility z-score over a rolling window (default: 7 days)
+    - Calculate implied volatility (Deribit DVOL) z-score over a rolling window (default: 7 days)
     - Calculate 24-hour rolling price momentum (% change)
     - Map momentum values into z-score over 7-day lookback
 
@@ -21,48 +21,38 @@ class IVMomentumStrategy(Strategy):
     - Volatility is "normal" (z-score within ±1 SD)
     - Price momentum is extreme (z-score > 2 SD for long, < -2 SD for short)
 
-    Pyramiding logic:
-    - When position reaches pyramid_threshold profit, add to position (Signal.ADD)
-    - After pyramiding, stop loss trails to breakeven (average entry price)
-
-    Exit logic:
-    - Stop loss at configurable % (default: 5%)
-    - Take profit at configurable % (default: 5%)
-    - After pyramid: SL moves to breakeven, TP calculated from avg entry
+    Exit modes (in priority order):
+    1. Time-based exit: Exit after hold_hours (if set)
+    2. Stop loss: Fixed % or ATR-based
+    3. Take profit: Fixed % or vol-based
 
     Parameters:
-        vol_lookback: Lookback periods for volatility z-score calculation (default: 168 = 7 days hourly)
-        vol_window: Window for realized volatility calculation (default: 24 = 24 hours)
-        momentum_period: Period for 24h momentum calculation (default: 24 hours)
+        # Direction filtering
+        direction: Trade direction - "both", "long_only", or "short_only" (default: "both")
+
+        # Entry parameters
+        vol_lookback: Lookback periods for IV z-score calculation (default: 168 = 7 days hourly)
+        momentum_period: Period for momentum calculation in hours (default: 24)
         momentum_lookback: Lookback for momentum z-score (default: 168 = 7 days)
         vol_threshold: Volatility must be within this many SDs to enter (default: 1.0)
         momentum_threshold: Momentum z-score threshold for entry (default: 2.0)
-        stop_loss_pct: Stop loss percentage (default: 0.05 = 5%) - used when use_atr_stops=False
-        take_profit_pct: Take profit percentage (default: 0.05 = 5%) - used when use_atr_stops=False
-        use_iv: If True and IV data available, use IV instead of realized vol (default: False)
-        pyramid_enabled: Enable pyramiding on winning trades (default: True)
-        pyramid_threshold: Profit % required to pyramid (default: 0.025 = 2.5%)
-        trail_to_breakeven: Move SL to breakeven after pyramid (default: True)
+
+        # Exit parameters - Simple mode
+        hold_hours: Fixed hold period in hours, None to disable (default: None)
+        stop_loss_pct: Stop loss percentage (default: 0.05 = 5%)
+        take_profit_pct: Take profit percentage (default: 0.05 = 5%)
+
+        # Exit parameters - Advanced mode
         use_atr_stops: Use ATR-based stops - 'sl_only', 'both', or False (default: False)
         atr_period: ATR calculation period on hourly data (default: 14 hours)
-        sl_atr_mult: Stop loss multiplier for ATR (default: 3.0 = 3×ATR below entry)
-        trail_atr_mult: Trailing stop multiplier for ATR (default: 6.0 = 6×ATR below high)
-        tp_sd_fraction: TP as fraction of 1 SD expected move (default: 0.5 = ~60% hit rate)
-        sl_sd_fraction: SL as fraction of 1 SD expected move (default: 0.5 = symmetric with TP)
+        sl_atr_mult: Stop loss multiplier for ATR (default: 3.0)
+        tp_sd_fraction: TP as fraction of 1 SD expected move, None to use fixed (default: None)
+        sl_sd_fraction: SL as fraction of 1 SD expected move, None to use fixed (default: None)
 
-        # Dynamic Exit Approaches
-        signal_invalidation_enabled: Exit when momentum z-score fades (default: False)
-        momentum_exit_threshold: Exit long when momentum < this, short when > -this (default: 1.0)
-        time_exit_enabled: Exit after max_hold_hours if TP not hit (default: False)
-        max_hold_hours: Max hours to hold position (default: 24)
-        asymmetric_tp_enabled: Use separate TP for long/short (default: False)
-        tp_long_pct: TP for long positions (default: 0.03 = 3%)
-        tp_short_pct: TP for short positions (default: 0.02 = 2%)
-        breakeven_after_profit_enabled: Move SL to breakeven after small profit (default: False)
-        breakeven_trigger_pct: Profit % to trigger breakeven move (default: 0.015 = 1.5%)
-        vol_floor_enabled: Enforce minimum TP/SL when using vol-based (default: False)
-        tp_floor_pct: Minimum TP percentage (default: 0.025 = 2.5%)
-        sl_floor_pct: Minimum SL percentage (default: 0.015 = 1.5%)
+        # Pyramiding (disabled by default)
+        pyramid_enabled: Enable pyramiding on winning trades (default: False)
+        pyramid_threshold: Profit % required to pyramid (default: 0.025 = 2.5%)
+        trail_to_breakeven: Move SL to breakeven after pyramid (default: True)
     """
 
     @property
@@ -71,52 +61,48 @@ class IVMomentumStrategy(Strategy):
 
     @property
     def description(self) -> str:
-        pyramid_enabled = self.params.get("pyramid_enabled", True)
-        if pyramid_enabled:
-            return "Enter on strong momentum when vol is normal, pyramid winners, trail SL to breakeven"
-        return "Enter on strong momentum when volatility is within normal range, with 5% SL/TP"
+        direction = self.params.get("direction", "both")
+        hold_hours = self.params.get("hold_hours", None)
+
+        dir_str = {"both": "long/short", "long_only": "long-only", "short_only": "short-only"}[direction]
+
+        if hold_hours:
+            return f"IV-momentum {dir_str}, {hold_hours}h time exit"
+        return f"IV-momentum {dir_str} with SL/TP"
 
     def _validate_params(self) -> None:
+        direction = self.params.get("direction", "both")
         vol_threshold = self.params.get("vol_threshold", 1.0)
         momentum_threshold = self.params.get("momentum_threshold", 2.0)
-        pyramid_threshold = self.params.get("pyramid_threshold", 0.025)
-        atr_period = self.params.get("atr_period", 14)
-        sl_atr_mult = self.params.get("sl_atr_mult", 2.0)
-        trail_atr_mult = self.params.get("trail_atr_mult", 2.0)
+        hold_hours = self.params.get("hold_hours", None)
 
+        if direction not in ("both", "long_only", "short_only"):
+            raise ValueError(f"direction must be 'both', 'long_only', or 'short_only', got '{direction}'")
         if vol_threshold <= 0:
             raise ValueError(f"vol_threshold ({vol_threshold}) must be positive")
         if momentum_threshold <= 0:
             raise ValueError(f"momentum_threshold ({momentum_threshold}) must be positive")
-        if pyramid_threshold <= 0:
-            raise ValueError(f"pyramid_threshold ({pyramid_threshold}) must be positive")
-        if atr_period <= 0:
-            raise ValueError(f"atr_period ({atr_period}) must be positive")
-        if sl_atr_mult <= 0:
-            raise ValueError(f"sl_atr_mult ({sl_atr_mult}) must be positive")
-        if trail_atr_mult <= 0:
-            raise ValueError(f"trail_atr_mult ({trail_atr_mult}) must be positive")
+        if hold_hours is not None and hold_hours <= 0:
+            raise ValueError(f"hold_hours ({hold_hours}) must be positive")
 
     def get_required_columns(self) -> list[str]:
-        """Only requires OHLCV - IV is optional."""
-        return ["open", "high", "low", "close", "volume"]
+        """Requires OHLCV plus IV data."""
+        return ["open", "high", "low", "close", "volume", "iv"]
 
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate volatility z-score, momentum z-score, and ATR."""
         vol_lookback = self.params.get("vol_lookback", 168)  # 7 days in hours
-        vol_window = self.params.get("vol_window", 24)  # 24 hours for realized vol
         momentum_period = self.params.get("momentum_period", 24)  # 24 hours
         momentum_lookback = self.params.get("momentum_lookback", 168)  # 7 days
-        use_iv = self.params.get("use_iv", False)
         atr_period = self.params.get("atr_period", 14)
 
-        # Calculate volatility - use IV if available and requested, otherwise realized vol
-        if use_iv and "iv" in df.columns and df["iv"].notna().sum() > len(df) * 0.5:
-            vol = df["iv"]
-        else:
-            # Calculate realized volatility from returns (annualized)
-            returns = df["close"].pct_change()
-            vol = returns.rolling(window=vol_window, min_periods=vol_window // 2).std() * np.sqrt(525600)  # Annualize for 1-min data
+        if "iv" not in df.columns or df["iv"].isna().all():
+            raise ValueError("IV data is required for IVMomentumStrategy but is missing or empty.")
+
+        # Use Deribit DVOL implied volatility (convert percent to decimal if needed).
+        vol = df["iv"].copy()
+        if vol.max() > 3:
+            vol = vol / 100.0
 
         df["volatility"] = vol
 
@@ -200,31 +186,29 @@ class IVMomentumStrategy(Strategy):
         signals = pd.Series(index=df.index, dtype=object)
         signals[:] = Signal.HOLD
 
-        # Get parameters
+        # Direction filtering
+        direction = self.params.get("direction", "both")
+        allow_long = direction in ("both", "long_only")
+        allow_short = direction in ("both", "short_only")
+
+        # Entry parameters
         vol_threshold = self.params.get("vol_threshold", 1.0)
         momentum_threshold = self.params.get("momentum_threshold", 2.0)
+
+        # Exit parameters - simple mode
+        hold_hours = self.params.get("hold_hours", None)  # Time-based exit
         stop_loss_pct = self.params.get("stop_loss_pct", 0.05)
         take_profit_pct = self.params.get("take_profit_pct", 0.05)
-        pyramid_enabled = self.params.get("pyramid_enabled", True)
-        pyramid_threshold = self.params.get("pyramid_threshold", 0.025)
-        trail_to_breakeven = self.params.get("trail_to_breakeven", True)
 
-        # ATR parameters
-        # use_atr_stops can be: 'sl_only' (ATR SL + fixed TP), 'both' (ATR for both), or False (fixed %)
-        use_atr_stops = self.params.get("use_atr_stops", "sl_only")
+        # Exit parameters - advanced mode
+        use_atr_stops = self.params.get("use_atr_stops", False)  # Default to fixed %
         sl_atr_mult = self.params.get("sl_atr_mult", 3.0)
         trail_atr_mult = self.params.get("trail_atr_mult", 6.0)
 
-        # Dynamic exit parameters
-        signal_invalidation_enabled = self.params.get("signal_invalidation_enabled", False)
-        momentum_exit_threshold = self.params.get("momentum_exit_threshold", 1.0)
-        time_exit_enabled = self.params.get("time_exit_enabled", False)
-        max_hold_hours = self.params.get("max_hold_hours", 24)
-        asymmetric_tp_enabled = self.params.get("asymmetric_tp_enabled", False)
-        tp_long_pct = self.params.get("tp_long_pct", 0.03)
-        tp_short_pct = self.params.get("tp_short_pct", 0.02)
-        breakeven_after_profit_enabled = self.params.get("breakeven_after_profit_enabled", False)
-        breakeven_trigger_pct = self.params.get("breakeven_trigger_pct", 0.015)
+        # Pyramiding (disabled by default)
+        pyramid_enabled = self.params.get("pyramid_enabled", False)
+        pyramid_threshold = self.params.get("pyramid_threshold", 0.025)
+        trail_to_breakeven = self.params.get("trail_to_breakeven", True)
 
         vol_zscore = df["vol_zscore"]
         momentum_zscore = df["momentum_zscore"]
@@ -270,8 +254,8 @@ class IVMomentumStrategy(Strategy):
             use_atr_trail = use_atr_stops == "both" and current_atr > 0
 
             if position == 0:
-                # Check for entry
-                if current_vol_normal and current_momentum_long:
+                # Check for entry (with direction filtering)
+                if allow_long and current_vol_normal and current_momentum_long:
                     signals.iloc[i] = Signal.LONG
                     position = 1
                     entry_price = current_price
@@ -281,14 +265,13 @@ class IVMomentumStrategy(Strategy):
                     highest_since_entry = current_price
                     lowest_since_entry = current_price
                     entry_bar_index = i  # For time-based exit
-                    breakeven_moved = False  # For breakeven after profit
-                    # Set initial stop level using vol-based SL
+                    # Set initial stop level
                     current_vol_sl = vol_sl.iloc[i] if not pd.isna(vol_sl.iloc[i]) else stop_loss_pct
                     if use_atr_sl:
                         stop_level = entry_price - (sl_atr_mult * current_atr)
                     else:
                         stop_level = entry_price * (1 - current_vol_sl)
-                elif current_vol_normal and current_momentum_short:
+                elif allow_short and current_vol_normal and current_momentum_short:
                     signals.iloc[i] = Signal.SHORT
                     position = -1
                     entry_price = current_price
@@ -298,8 +281,7 @@ class IVMomentumStrategy(Strategy):
                     highest_since_entry = current_price
                     lowest_since_entry = current_price
                     entry_bar_index = i  # For time-based exit
-                    breakeven_moved = False  # For breakeven after profit
-                    # Set initial stop level using vol-based SL
+                    # Set initial stop level
                     current_vol_sl = vol_sl.iloc[i] if not pd.isna(vol_sl.iloc[i]) else stop_loss_pct
                     if use_atr_sl:
                         stop_level = entry_price + (sl_atr_mult * current_atr)
@@ -318,35 +300,21 @@ class IVMomentumStrategy(Strategy):
                     pnl_pct = (avg_entry_price - current_price) / avg_entry_price
                     pnl_from_entry = (entry_price - current_price) / entry_price
 
-                # Breakeven trail after profit (independent of pyramiding)
-                if breakeven_after_profit_enabled and not breakeven_moved:
-                    if pnl_pct >= breakeven_trigger_pct:
-                        breakeven_moved = True
-                        if position == 1:
-                            stop_level = max(stop_level, entry_price)
-                        else:
-                            stop_level = min(stop_level, entry_price)
-
                 # Calculate effective stop level
                 if use_atr_trail:
-                    # ATR trailing stop mode
-                    if position == 1:  # Long
+                    if position == 1:
                         trail_stop = highest_since_entry - (trail_atr_mult * current_atr)
                         effective_stop = max(stop_level, trail_stop)
-                    else:  # Short
+                    else:
                         trail_stop = lowest_since_entry + (trail_atr_mult * current_atr)
                         effective_stop = min(stop_level, trail_stop)
-
-                    # After pyramid with trail_to_breakeven, stop moves to avg entry
                     if pyramided and trail_to_breakeven:
                         if position == 1:
                             effective_stop = max(effective_stop, avg_entry_price)
                         else:
                             effective_stop = min(effective_stop, avg_entry_price)
                 else:
-                    # Fixed or ATR SL only - no trailing, use stop_level directly
                     if pyramided and trail_to_breakeven:
-                        # After pyramid, stop is at breakeven
                         if position == 1:
                             effective_stop = max(stop_level, avg_entry_price)
                         else:
@@ -354,105 +322,66 @@ class IVMomentumStrategy(Strategy):
                     else:
                         effective_stop = stop_level
 
-                # Check for pyramid opportunity (only if not already pyramided)
-                if pyramid_enabled and not pyramided and pnl_from_entry >= pyramid_threshold:
+                # Helper to reset position state
+                def reset_position():
+                    nonlocal position, entry_price, avg_entry_price, pyramided
+                    nonlocal stop_level, highest_since_entry, lowest_since_entry, entry_bar_index
+                    position = 0
+                    entry_price = 0.0
+                    avg_entry_price = 0.0
+                    pyramided = False
+                    stop_level = 0.0
+                    highest_since_entry = 0.0
+                    lowest_since_entry = 0.0
+                    entry_bar_index = 0
+
+                # EXIT PRIORITY ORDER:
+                # 1. Time-based exit (if hold_hours is set)
+                # 2. Stop loss hit
+                # 3. Take profit hit
+                # 4. Pyramid (if enabled)
+
+                exited = False
+
+                # 1. Time-based exit
+                if hold_hours is not None:
+                    bars_held = i - entry_bar_index
+                    hours_held = bars_held / 60
+                    if hours_held >= hold_hours:
+                        signals.iloc[i] = Signal.CLOSE
+                        reset_position()
+                        exited = True
+
+                # 2. Stop loss check
+                if not exited:
+                    if position == 1 and current_price <= effective_stop:
+                        signals.iloc[i] = Signal.CLOSE
+                        reset_position()
+                        exited = True
+                    elif position == -1 and current_price >= effective_stop:
+                        signals.iloc[i] = Signal.CLOSE
+                        reset_position()
+                        exited = True
+
+                # 3. Take profit check (only if no time exit and not using ATR trailing)
+                if not exited and hold_hours is None and not use_atr_trail:
+                    tp_target = vol_tp.iloc[i] if not pd.isna(vol_tp.iloc[i]) else take_profit_pct
+                    if pnl_pct >= tp_target:
+                        signals.iloc[i] = Signal.CLOSE
+                        reset_position()
+                        exited = True
+
+                # 4. Pyramid check
+                if not exited and pyramid_enabled and not pyramided and pnl_from_entry >= pyramid_threshold:
                     signals.iloc[i] = Signal.ADD
                     pyramided = True
                     pyramid_add_count += 1
-                    # Calculate new average entry (assuming equal size add)
                     avg_entry_price = (entry_price + current_price) / 2
-                    # After pyramid, move stop to breakeven (avg entry)
                     if trail_to_breakeven:
                         if position == 1:
                             stop_level = max(stop_level, avg_entry_price)
                         else:
                             stop_level = min(stop_level, avg_entry_price)
-
-                # Signal invalidation exit - momentum z-score faded
-                elif signal_invalidation_enabled:
-                    should_exit = False
-                    if position == 1 and current_momentum_zscore < momentum_exit_threshold:
-                        should_exit = True  # Long but momentum faded
-                    elif position == -1 and current_momentum_zscore > -momentum_exit_threshold:
-                        should_exit = True  # Short but momentum faded
-
-                    if should_exit:
-                        signals.iloc[i] = Signal.CLOSE
-                        position = 0
-                        entry_price = 0.0
-                        avg_entry_price = 0.0
-                        pyramided = False
-                        stop_level = 0.0
-                        highest_since_entry = 0.0
-                        lowest_since_entry = 0.0
-                        entry_bar_index = 0
-                        breakeven_moved = False
-
-                # Time-based exit - held too long without hitting TP
-                elif time_exit_enabled:
-                    bars_held = i - entry_bar_index
-                    hours_held = bars_held / 60  # Minute bars to hours
-
-                    if hours_held >= max_hold_hours:
-                        signals.iloc[i] = Signal.CLOSE
-                        position = 0
-                        entry_price = 0.0
-                        avg_entry_price = 0.0
-                        pyramided = False
-                        stop_level = 0.0
-                        highest_since_entry = 0.0
-                        lowest_since_entry = 0.0
-                        entry_bar_index = 0
-                        breakeven_moved = False
-
-                # Check for exit - stop hit
-                elif position == 1 and current_price <= effective_stop:
-                    signals.iloc[i] = Signal.CLOSE
-                    position = 0
-                    entry_price = 0.0
-                    avg_entry_price = 0.0
-                    pyramided = False
-                    stop_level = 0.0
-                    highest_since_entry = 0.0
-                    lowest_since_entry = 0.0
-                    entry_bar_index = 0
-                    breakeven_moved = False
-                elif position == -1 and current_price >= effective_stop:
-                    signals.iloc[i] = Signal.CLOSE
-                    position = 0
-                    entry_price = 0.0
-                    avg_entry_price = 0.0
-                    pyramided = False
-                    stop_level = 0.0
-                    highest_since_entry = 0.0
-                    lowest_since_entry = 0.0
-                    entry_bar_index = 0
-                    breakeven_moved = False
-
-                # Take profit check
-                elif not use_atr_trail:
-                    # Determine TP target based on mode
-                    if asymmetric_tp_enabled:
-                        # Use separate TP for long/short based on observed data
-                        if position == 1:
-                            tp_target = tp_long_pct
-                        else:
-                            tp_target = tp_short_pct
-                    else:
-                        # Use vol-based TP (default)
-                        tp_target = vol_tp.iloc[i] if not pd.isna(vol_tp.iloc[i]) else take_profit_pct
-
-                    if pnl_pct >= tp_target:
-                        signals.iloc[i] = Signal.CLOSE
-                        position = 0
-                        entry_price = 0.0
-                        avg_entry_price = 0.0
-                        pyramided = False
-                        stop_level = 0.0
-                        highest_since_entry = 0.0
-                        lowest_since_entry = 0.0
-                        entry_bar_index = 0
-                        breakeven_moved = False
 
         indicators = {
             "volatility": df["volatility"],
@@ -473,6 +402,8 @@ class IVMomentumStrategy(Strategy):
         closes = (signals == Signal.CLOSE).sum()
 
         metadata = {
+            "direction": direction,
+            "hold_hours": hold_hours,
             "long_entries": long_entries,
             "short_entries": short_entries,
             "pyramid_adds": adds,
@@ -480,7 +411,6 @@ class IVMomentumStrategy(Strategy):
             "vol_normal_periods": vol_normal.sum(),
             "momentum_long_periods": momentum_long.sum(),
             "momentum_short_periods": momentum_short.sum(),
-            "use_atr_stops": use_atr_stops,
         }
 
         return StrategyResult(signals=signals, indicators=indicators, metadata=metadata)

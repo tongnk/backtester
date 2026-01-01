@@ -39,6 +39,11 @@ class BacktestResult:
     initial_capital: float
     final_capital: float
 
+    # Funding data (only populated in perps mode)
+    funding_df: pd.DataFrame = field(default_factory=pd.DataFrame)
+    total_funding: float = 0.0
+    perps_mode: bool = False
+
 
 class Backtester:
     """
@@ -82,11 +87,20 @@ class Backtester:
         # Validate data
         strategy.validate_data(data)
 
+        # Check perps mode and set appropriate fee rate
+        perps_mode = self.config.backtest.perps.enabled
+        if perps_mode:
+            fee_rate = self.config.backtest.perps.effective_fee_rate
+            print(f"Perps mode enabled - fee rate: {fee_rate:.4%}")
+        else:
+            fee_rate = self.config.backtest.fee_rate
+
         # Initialize position manager
         self.position_manager = PositionManager(
             max_positions=self.config.position.max_pyramid_levels,
-            fee_rate=self.config.backtest.fee_rate,
+            fee_rate=fee_rate,
             slippage=self.config.backtest.slippage,
+            perps_mode=perps_mode,
         )
 
         # Run strategy to get signals
@@ -102,6 +116,10 @@ class Backtester:
         capital = initial_capital
         equity = []
         equity_timestamps = []
+        total_funding = 0.0
+
+        # Get funding times for perps mode
+        funding_times_utc = self.config.backtest.perps.funding_times_utc if perps_mode else ()
 
         # Process each bar
         print(f"Processing {len(data)} bars...")
@@ -115,12 +133,29 @@ class Backtester:
             # Calculate current equity
             current_price = current_bar["close"]
             unrealized_pnl = 0.0
+            accumulated_funding = 0.0
             if not self.position_manager.is_flat:
-                unrealized_pnl = self.position_manager.current_position.unrealized_pnl(current_price)
+                position = self.position_manager.current_position
+                unrealized_pnl = position.unrealized_pnl(current_price)
+                accumulated_funding = position.total_funding
 
-            current_equity = capital + unrealized_pnl
+            # Equity includes unrealized PnL minus accumulated funding
+            current_equity = capital + unrealized_pnl - accumulated_funding
             equity.append(current_equity)
             equity_timestamps.append(timestamp)
+
+            # Apply funding at funding times (perps mode)
+            if perps_mode and not self.position_manager.is_flat:
+                if self._is_funding_time(timestamp, funding_times_utc):
+                    funding_rate = current_bar.get("funding_rate", 0.0)
+                    if pd.notna(funding_rate) and funding_rate != 0.0:
+                        payment = self.position_manager.apply_funding(
+                            timestamp=timestamp,
+                            funding_rate=funding_rate,
+                            mark_price=current_price,
+                        )
+                        if payment:
+                            total_funding += payment.amount
 
             # Process signal (use next bar's open for execution to avoid look-ahead bias)
             if i < len(data) - 1:
@@ -151,6 +186,7 @@ class Backtester:
         # Get trade data
         trades_df = self.position_manager.get_trades_df()
         trade_log_df = self.position_manager.get_trade_log_df()
+        funding_df = self.position_manager.get_funding_log_df() if perps_mode else pd.DataFrame()
 
         # Calculate metrics
         metrics = self.metrics_calculator.calculate(
@@ -158,6 +194,7 @@ class Backtester:
             trades_df=trades_df,
             initial_capital=initial_capital,
             price_series=data["close"],
+            funding_df=funding_df,
         )
 
         return BacktestResult(
@@ -173,7 +210,15 @@ class Backtester:
             end_date=data.index[-1].to_pydatetime(),
             initial_capital=initial_capital,
             final_capital=capital,
+            # Funding data
+            funding_df=funding_df,
+            total_funding=total_funding,
+            perps_mode=perps_mode,
         )
+
+    def _is_funding_time(self, timestamp: pd.Timestamp, funding_times: tuple) -> bool:
+        """Check if timestamp is at a funding time (e.g., 00:00, 08:00, 16:00 UTC)."""
+        return timestamp.hour in funding_times and timestamp.minute == 0
 
     def _process_signal(
         self,

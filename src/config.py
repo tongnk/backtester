@@ -44,15 +44,38 @@ class PositionConfig:
 
 
 @dataclass
+class PerpsConfig:
+    """Perpetual futures configuration."""
+    enabled: bool = False  # Whether to use perps mode
+
+    # Fee structure (lower than spot)
+    maker_fee_rate: float = 0.0002  # 0.02% maker
+    taker_fee_rate: float = 0.0004  # 0.04% taker
+    use_maker_fees: bool = False    # Assume taker by default
+
+    # Funding configuration
+    funding_interval_hours: int = 8  # Funding every 8 hours
+    funding_times_utc: tuple = (0, 8, 16)  # 00:00, 08:00, 16:00 UTC
+
+    @property
+    def effective_fee_rate(self) -> float:
+        """Get the effective fee rate based on maker/taker setting."""
+        return self.maker_fee_rate if self.use_maker_fees else self.taker_fee_rate
+
+
+@dataclass
 class BacktestConfig:
     """Backtesting configuration."""
     initial_capital: float = 10000.0
-    fee_rate: float = 0.001  # 0.1% per trade
+    fee_rate: float = 0.001  # 0.1% per trade (spot default)
     slippage: float = 0.0001  # 0.01% slippage
 
     # Date range
     start_date: Optional[str] = None
     end_date: Optional[str] = None
+
+    # Perpetual futures config
+    perps: PerpsConfig = field(default_factory=PerpsConfig)
 
 
 @dataclass

@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(pip3 install:*)",
-      "Bash(python run_backtest.py:*)"
+      "Bash(python run_backtest.py:*)",
+      "Bash(python run_parameter_sweep.py:*)",
+      "Bash(python run_detailed_sweep.py:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(cat:*)",
+      "Bash(python3:*)"
     ]
   }
 }
